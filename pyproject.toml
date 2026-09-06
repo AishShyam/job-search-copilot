@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "An agentic job search copilot: observes listings, evaluates fit, and produces a ranked digest, tailored resumes, and outreach drafts."
 requires-python = ">=3.12"
 dependencies = [
+    "litellm>=1.100.0",
     "pydantic[email]>=2.13.5",
     "pyyaml>=6.0.3",
     "tzdata>=2026.3",
