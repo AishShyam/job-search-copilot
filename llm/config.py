@@ -1,8 +1,8 @@
 """Map a validated LLM configuration to concrete LiteLLM call parameters.
 
-Turns the ``llm`` section of ``profile.yaml`` (already validated into an
-``LlmConfig`` by S0-01) into the provider-prefixed model string LiteLLM
-expects, so no caller ever hardcodes a provider or a model name.
+Turns the validated ``llm`` section of ``profile.yaml`` (an ``LlmConfig``)
+into the provider-prefixed model string LiteLLM expects, so no caller ever
+hardcodes a provider or a model name.
 """
 
 from __future__ import annotations
@@ -32,6 +32,10 @@ class ProviderSelection:
         model: The provider-native model id, exactly as given in the profile.
         litellm_model: ``provider/model`` -- the string ``litellm.completion``
             takes as its ``model=`` argument.
+
+    A small, fixed result object holding three things: the provider name, the
+    plain model id, and the fully-formatted string LiteLLM actually wants.
+    frozen=True again means it can't be modified after creation.
     """
 
     provider: LlmProvider
@@ -45,8 +49,8 @@ def select_provider(llm: LlmConfig, *, use_fallback: bool = False) -> ProviderSe
     Args:
         llm: The validated ``llm`` section of the profile.
         use_fallback: When ``True``, resolve ``fallback_provider`` /
-            ``fallback_model`` instead of the primary pair. S0-01 guarantees
-            those two fields are set together or not at all.
+            ``fallback_model`` instead of the primary pair. The config schema
+            guarantees those two fields are set together or not at all.
 
     Returns:
         The resolved :class:`ProviderSelection`.

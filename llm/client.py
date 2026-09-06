@@ -2,8 +2,7 @@
 
 Every LLM call in the project routes through this one function. It returns
 a typed result or a typed error and never raises a provider/network/config
-exception into its caller, so the Reason/Act loop can treat a model failure
-as data (CONVENTIONS.md error-handling rule for the LLM layer).
+exception into its caller, so callers can treat a model failure as data.
 """
 
 from __future__ import annotations
@@ -23,8 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Without this, LiteLLM inherits each provider SDK's own default request
 # timeout, which varies widely. Pin one so a hung provider fails
-# predictably as a Timeout that completion() can catch. Not yet
-# profile-configurable -- see the S0-04 task-log row.
+# predictably as a Timeout that completion() can catch.
 REQUEST_TIMEOUT_SECONDS = 120
 
 
@@ -92,6 +90,9 @@ def completion(
         on any failure. This function never raises for a provider, network,
         or config problem.
     """
+    # If no config was explicitly passed in, load the real one from
+    # profile.yaml. If that fails, don't crash — hand back a CompletionError
+    # immediately.
     if config is None:
         try:
             config = load_profile().llm
@@ -100,12 +101,16 @@ def completion(
                 message=f"could not load LLM config: {exc}",
                 error_type="config_error",
             )
-
+    # Figures out which actual provider/model to use (logic lives in
+    # llm/config.py). Same pattern: any failure becomes a returned error, not
+    # a crash.
     try:
         selection = select_provider(config)
     except ValueError as exc:
         return CompletionError(message=str(exc), error_type="config_error")
 
+    # Builds the standard chat-message format and makes the actual call
+    # (delegated to a helper below).
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
@@ -113,8 +118,8 @@ def completion(
 
     result = _call_once(selection, messages, temperature, max_tokens)
 
-    # Optional single retry on the configured fallback provider. S0-01
-    # already guarantees fallback_provider/fallback_model are set together.
+    # Optional single retry on the configured fallback provider. The config
+    # schema guarantees fallback_provider and fallback_model are set together.
     if isinstance(result, CompletionError) and config.fallback_provider is not None:
         logger.warning(
             "primary provider %s failed (%s); retrying with fallback %s",
@@ -131,6 +136,7 @@ def completion(
     return result
 
 
+# makes exactly one real call to LiteLLM
 def _call_once(
     selection: ProviderSelection,
     messages: list[dict[str, str]],
@@ -146,7 +152,7 @@ def _call_once(
             max_tokens=max_tokens,
             timeout=REQUEST_TIMEOUT_SECONDS,
             # Silently drop params a given provider doesn't accept, so the
-            # same call shape works for every provider (FR15).
+            # same call shape works for every provider.
             drop_params=True,
         )
     except (APIConnectionError, APIError, Timeout) as exc:

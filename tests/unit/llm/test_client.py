@@ -4,10 +4,13 @@ LiteLLM is mocked at this level: no real network or API call. These tests
 prove the output contract shape, the profile-driven provider selection, and
 that every provider/network failure is returned as a typed CompletionError
 rather than raised.
+
+`llm_config` and `write_profile` are factory fixtures from tests/conftest.py.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -15,42 +18,9 @@ from typing import Any
 import pytest
 from litellm.exceptions import APIError, Timeout
 
-from config.loader import load_profile
 from config.schema import LlmConfig
 from llm import client as client_module
 from llm.client import CompletionError, CompletionResult, completion
-
-
-def _write_profile(
-    tmp_path: Path,
-    *,
-    provider: str = "ollama",
-    model: str = "llama3.1",
-    fallback: tuple[str, str] | None = None,
-) -> Path:
-    lines = [
-        'resume_path: "cv.pdf"',
-        "preferred_roles:",
-        '  - "Backend Engineer"',
-        "locations:",
-        '  - "Remote"',
-        'email: "me@example.com"',
-        "llm:",
-        f'  provider: "{provider}"',
-        f'  model: "{model}"',
-    ]
-    if fallback is not None:
-        lines += [
-            f'  fallback_provider: "{fallback[0]}"',
-            f'  fallback_model: "{fallback[1]}"',
-        ]
-    path = tmp_path / "profile.yaml"
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return path
-
-
-def _load_llm(tmp_path: Path, **kwargs: Any) -> LlmConfig:
-    return load_profile(_write_profile(tmp_path, **kwargs)).llm
 
 
 def _fake_response(
@@ -84,8 +54,8 @@ def _patch_litellm(monkeypatch: pytest.MonkeyPatch, fake: Any) -> None:
     ],
 )
 def test_completion__mocked_provider__returns_all_five_fields_same_shape(
-    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    llm_config: Callable[..., LlmConfig],
     provider: str,
     model: str,
 ) -> None:
@@ -96,9 +66,14 @@ def test_completion__mocked_provider__returns_all_five_fields_same_shape(
         return _fake_response(model=model)
 
     _patch_litellm(monkeypatch, fake_completion)
-    llm = _load_llm(tmp_path, provider=provider, model=model)
 
-    result = completion("sys prompt", "user prompt", 0.2, 256, config=llm)
+    result = completion(
+        "sys prompt",
+        "user prompt",
+        0.2,
+        256,
+        config=llm_config(provider=provider, model=model),
+    )
 
     assert isinstance(result, CompletionResult)
     assert isinstance(result.text, str) and result.text == "hello"
@@ -117,16 +92,15 @@ def test_completion__mocked_provider__returns_all_five_fields_same_shape(
 
 
 def test_completion__response_without_usage__tokens_default_to_zero(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, llm_config: Callable[..., LlmConfig]
 ) -> None:
     response = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="x"))],
         model="llama3.1",
     )
     _patch_litellm(monkeypatch, lambda **_: response)
-    llm = _load_llm(tmp_path)
 
-    result = completion("sys", "user", 0.0, 128, config=llm)
+    result = completion("sys", "user", 0.0, 128, config=llm_config())
 
     assert isinstance(result, CompletionResult)
     assert result.input_tokens == 0
@@ -137,14 +111,16 @@ def test_completion__response_without_usage__tokens_default_to_zero(
 
 
 def test_completion__no_config_arg__reads_provider_from_real_profile(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    write_profile: Callable[..., Path],
 ) -> None:
-    # completion() with no config= must go through config/loader.load_profile,
+    # completion() with no config= must go through config.loader.load_profile,
     # which reads config/profile.yaml relative to the cwd.
-    cfg_dir = tmp_path / "config"
-    cfg_dir.mkdir()
-    _write_profile(tmp_path, provider="ollama", model="phi3").rename(
-        cfg_dir / "profile.yaml"
+    write_profile(
+        provider="ollama",
+        model="phi3",
+        dest=tmp_path / "config" / "profile.yaml",
     )
     monkeypatch.chdir(tmp_path)
 
@@ -177,15 +153,14 @@ def test_completion__missing_profile__returns_config_error(
 
 
 def test_completion__litellm_timeout__returns_error_not_raised(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, llm_config: Callable[..., LlmConfig]
 ) -> None:
     def raise_timeout(**_: Any) -> None:
         raise Timeout(message="too slow", model="llama3.1", llm_provider="ollama")
 
     _patch_litellm(monkeypatch, raise_timeout)
-    llm = _load_llm(tmp_path)
 
-    result = completion("sys", "user", 0.0, 64, config=llm)
+    result = completion("sys", "user", 0.0, 64, config=llm_config())
 
     assert isinstance(result, CompletionError)
     assert result.error_type == "timeout"
@@ -194,7 +169,7 @@ def test_completion__litellm_timeout__returns_error_not_raised(
 
 
 def test_completion__litellm_api_error__returns_provider_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, llm_config: Callable[..., LlmConfig]
 ) -> None:
     def raise_api(**_: Any) -> None:
         raise APIError(
@@ -205,26 +180,24 @@ def test_completion__litellm_api_error__returns_provider_error(
         )
 
     _patch_litellm(monkeypatch, raise_api)
-    llm = _load_llm(tmp_path)
 
-    result = completion("sys", "user", 0.0, 64, config=llm)
+    result = completion("sys", "user", 0.0, 64, config=llm_config())
 
     assert isinstance(result, CompletionError)
     assert result.error_type == "provider_error"
 
 
 def test_completion__unexpected_exception__is_caught_as_unexpected(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, llm_config: Callable[..., LlmConfig]
 ) -> None:
-    # Graceful degradation (NFR3): even an error type we didn't anticipate
-    # must not propagate out of completion().
+    # Even an error type we didn't anticipate must not propagate out of
+    # completion().
     def raise_weird(**_: Any) -> None:
         raise RuntimeError("litellm internal explosion")
 
     _patch_litellm(monkeypatch, raise_weird)
-    llm = _load_llm(tmp_path)
 
-    result = completion("sys", "user", 0.0, 64, config=llm)
+    result = completion("sys", "user", 0.0, 64, config=llm_config())
 
     assert isinstance(result, CompletionError)
     assert result.error_type == "unexpected"
@@ -234,10 +207,9 @@ def test_completion__unexpected_exception__is_caught_as_unexpected(
 
 
 def test_completion__primary_fails_with_fallback__retries_with_fallback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, llm_config: Callable[..., LlmConfig]
 ) -> None:
-    llm = _load_llm(
-        tmp_path,
+    llm = llm_config(
         provider="anthropic",
         model="claude-sonnet-4-5",
         fallback=("ollama", "llama3.1"),
@@ -260,16 +232,16 @@ def test_completion__primary_fails_with_fallback__retries_with_fallback(
 
 
 def test_completion__primary_fails_without_fallback__returns_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    monkeypatch: pytest.MonkeyPatch, llm_config: Callable[..., LlmConfig]
 ) -> None:
-    llm = _load_llm(tmp_path, provider="ollama", model="llama3.1")
-
     def always_down(**_: Any) -> None:
         raise RuntimeError("down")
 
     _patch_litellm(monkeypatch, always_down)
 
-    result = completion("sys", "user", 0.0, 64, config=llm)
+    result = completion(
+        "sys", "user", 0.0, 64, config=llm_config(provider="ollama", model="llama3.1")
+    )
 
     assert isinstance(result, CompletionError)
     assert result.provider == "ollama"
