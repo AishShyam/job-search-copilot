@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os  # reads SUPABASE_TEST_DB_URL from the environment, never hardcoded
-from collections.abc import Iterator  # modern source for generator type hints (not typing.Iterator)
+from collections.abc import Iterator  # generator type hints (not typing.Iterator)
 from pathlib import Path
 from uuid import UUID  # real UUID objects, not strings, for uuid-typed columns
 
@@ -11,7 +11,7 @@ import psycopg  # the raw Postgres driver -- low-level, no ORM, direct SQL
 import pytest
 from psycopg import Connection  # type hint only: marks params as live DB connections
 from psycopg.errors import (
-    CheckViolation,        # raised when a `check` constraint fails (e.g. the digest trigger)
+    CheckViolation,  # raised when a `check` constraint fails (e.g. the digest trigger)
     InsufficientPrivilege,  # raised when an RLS policy blocks an operation
 )
 
