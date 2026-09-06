@@ -17,7 +17,7 @@ Two things are proven here:
 from __future__ import annotations
 
 import os  # reads SUPABASE_TEST_DB_URL from the environment, never hardcoded
-from collections.abc import Iterator
+from collections.abc import Iterator  # modern source for generator type hints
 from pathlib import Path
 from uuid import UUID
 
@@ -29,6 +29,9 @@ from psycopg.errors import InsufficientPrivilege  # raised when a grant is missi
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCHEMA_PATH = REPO_ROOT / "state" / "schema.sql"
 RLS_PATH = REPO_ROOT / "state" / "rls_policies.sql"
+# The NEW file this task adds -- deliberately separate from the two above,
+# so applying it is opt-in (only this test file ever runs it), never part
+# of what a real instance gets by default.
 PARTNER_RLS_PATH = REPO_ROOT / "state" / "partner_shared_mode_rls.sql"
 TEST_DB_URL_ENV = "SUPABASE_TEST_DB_URL"
 
@@ -43,8 +46,9 @@ PARTNER_FORBIDDEN_TABLES = (
     "digest_roles",
 )
 
-# Two owners, seeded with one row each in every partner-readable table, so
-# "sees all rows" is a meaningful assertion (2 rows, not a filtered 1).
+# TWO owners this time (S0-02's tests only needed one) -- required to prove
+# "partner sees EVERY owner's rows", not just "partner sees the one row
+# that happens to exist."
 OWNER_A = UUID("11111111-1111-4111-8111-111111111111")
 OWNER_B = UUID("22222222-2222-4222-8222-222222222222")
 ROLE_A = UUID("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
@@ -61,6 +65,10 @@ def baseline_database() -> Iterator[Connection]:
     because applying two migrations and seeding is expensive; every test in
     this file shares the one connection and transaction, which is rolled
     back at teardown so nothing persists in the test project.
+
+    This is intentionally the SAME baseline as S0-02's own test file --
+    proving "still single-instance, nothing partner-related exists" is
+    exactly what tests using THIS fixture (not partner_database) check.
     """
     database_url = os.getenv(TEST_DB_URL_ENV)
     if not database_url:
@@ -96,6 +104,13 @@ def baseline_database() -> Iterator[Connection]:
 def partner_database(baseline_database: Connection) -> Iterator[Connection]:
     """``baseline_database`` plus the partner pattern, applied in a savepoint.
 
+    Fixtures can depend on other fixtures -- this one takes baseline_database
+    as a parameter and layers on top of it. NOT module-scoped (default =
+    function-scoped), so the partner pattern is applied fresh and rolled
+    back for every single test that asks for this fixture -- keeping
+    "applied" tests and "not applied" tests (which use baseline_database
+    directly instead) cleanly separated.
+
     Applying it here -- inside the test's own setup, never merged into the
     shared schema files -- is the whole point of the pattern: it proves the
     policy is expressible in Postgres RLS without shipping it to every
@@ -129,6 +144,9 @@ def _seed_two_owners(cursor: psycopg.Cursor) -> None:
         """,
         (OWNER_A, OWNER_B),
     )
+    # Loop over both owners so each gets an identical set of rows --
+    # symmetric seed data makes "sorted(rows) == sorted([A, B])" a clean
+    # assertion later, rather than special-casing one owner vs. the other.
     for role_id, owner_id, company in (
         (ROLE_A, OWNER_A, "Alpha Co"),
         (ROLE_B, OWNER_B, "Beta Co"),
@@ -169,16 +187,20 @@ def _run_as_partner(
     """Execute one statement as ``partner_readonly``, then roll it back.
 
     Mirrors ``test_schema.py``'s ``_execute_as`` helper: a savepoint scopes
-    both the simulated role and any writes to this single call.
+    both the simulated role and any writes to this single call, so many
+    tests can reuse one connection without leaking state between them.
     """
     connection.execute("savepoint partner_op")
     error: Exception | None = None
     rows: list[tuple] = []
     try:
         # `set local role` is reverted by the savepoint rollback below,
-        # exactly as in test_schema.py.
+        # exactly as in test_schema.py -- scoped to just this operation.
         connection.execute(f"set local role {PARTNER_ROLE}")
         result = connection.execute(statement, parameters)
+        # description is None for statements with no result set (e.g.
+        # insert/update/delete without RETURNING) -- only fetch if there's
+        # actually something to fetch.
         if result.description is not None:
             rows = result.fetchall()
     except Exception as exc:  # noqa: BLE001 -- re-raised below after cleanup
@@ -197,7 +219,9 @@ def test_partner_pattern__partner_selects_shared_table__sees_every_owners_rows(
     partner_database: Connection, table: str
 ) -> None:
     # One row per owner was seeded. `using (true)` means the partner sees
-    # BOTH -- proving this is table-scoped access, not a per-owner subset.
+    # BOTH -- proving this is table-scoped access, not a per-owner subset
+    # (which is what would happen if the pattern accidentally reused
+    # S0-02's owner_id = auth.uid() style filter instead).
     rows = _run_as_partner(partner_database, f"select owner_id from public.{table}")
 
     assert sorted(row[0] for row in rows) == sorted([OWNER_A, OWNER_B])
@@ -208,7 +232,9 @@ def test_partner_pattern__partner_selects_other_table__is_denied(
     partner_database: Connection, table: str
 ) -> None:
     # partner_readonly has no SELECT grant on any table outside the two
-    # shared ones -> blocked before RLS is even evaluated.
+    # shared ones -> blocked before RLS is even evaluated (same grant vs.
+    # policy distinction as S0-02: no grant means the operation never gets
+    # far enough to check row-level rules at all).
     with pytest.raises(InsufficientPrivilege):
         _run_as_partner(partner_database, f"select * from public.{table}")
 
@@ -231,8 +257,11 @@ def test_partner_pattern__partner_writes_shared_table__is_denied(
     statement: str,
     parameters: tuple[object, ...],
 ) -> None:
-    # The grant is SELECT only -- every write verb is rejected even on the
-    # two tables the partner can read.
+    # The grant given to partner_readonly is SELECT only -- every write
+    # verb is rejected even on the two tables the partner CAN read from.
+    # This is what makes the access genuinely "read-only": no grant was
+    # ever given for insert/update/delete, so there's nothing for an RLS
+    # policy to even permit or deny here.
     with pytest.raises(InsufficientPrivilege):
         _run_as_partner(partner_database, statement, parameters)
 
@@ -240,8 +269,9 @@ def test_partner_pattern__partner_writes_shared_table__is_denied(
 def test_partner_pattern__applied__creates_only_two_scoped_select_policies(
     partner_database: Connection,
 ) -> None:
-    # The pattern must add exactly two policies, both SELECT, both on the
-    # shared tables, both targeting only the partner role.
+    # The pattern must add EXACTLY two policies, both SELECT, both on the
+    # shared tables, both targeting only the partner role -- guards against
+    # the pattern accidentally being broader (or narrower) than intended.
     rows = partner_database.execute(
         """
         select tablename, cmd, roles
@@ -261,8 +291,9 @@ def test_partner_pattern__applied__creates_only_two_scoped_select_policies(
 def test_partner_pattern__not_applied__partner_role_does_not_exist(
     baseline_database: Connection,
 ) -> None:
-    # On a database carrying only S0-02's schema + RLS, the partner role
-    # was never created.
+    # Uses baseline_database directly (NOT partner_database) -- on a
+    # database carrying only S0-02's schema + RLS, the partner role was
+    # never created at all. This is the "inactive by default" proof.
     row = baseline_database.execute(
         "select 1 from pg_catalog.pg_roles where rolname = %s",
         (PARTNER_ROLE,),
@@ -276,7 +307,8 @@ def test_partner_pattern__not_applied__no_cross_instance_policy_exists(
 ) -> None:
     # Every S0-02 policy targets `authenticated` and only `authenticated`;
     # there is no partner/cross-instance grantee anywhere in the applied
-    # schema until this pattern's file is explicitly run.
+    # schema until this pattern's file is explicitly run. Confirms S0-02's
+    # own policies are untouched/unaffected by this task's existence.
     rows = baseline_database.execute(
         """
         select policyname, roles
