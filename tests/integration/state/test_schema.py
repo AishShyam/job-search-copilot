@@ -2,21 +2,26 @@
 
 from __future__ import annotations
 
-import os
-from collections.abc import Iterator
+import os  # reads SUPABASE_TEST_DB_URL from the environment, never hardcoded
+from collections.abc import Iterator  # modern source for generator type hints (not typing.Iterator)
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID  # real UUID objects, not strings, for uuid-typed columns
 
-import psycopg
+import psycopg  # the raw Postgres driver -- low-level, no ORM, direct SQL
 import pytest
-from psycopg import Connection
-from psycopg.errors import CheckViolation, InsufficientPrivilege
+from psycopg import Connection  # type hint only: marks params as live DB connections
+from psycopg.errors import (
+    CheckViolation,        # raised when a `check` constraint fails (e.g. the digest trigger)
+    InsufficientPrivilege,  # raised when an RLS policy blocks an operation
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCHEMA_PATH = REPO_ROOT / "state" / "schema.sql"
 RLS_PATH = REPO_ROOT / "state" / "rls_policies.sql"
 TEST_DB_URL_ENV = "SUPABASE_TEST_DB_URL"
 
+# Two fixed fake user IDs -- the whole suite is built around proving A
+# can't see/touch B's data, and vice versa.
 OWNER_A = UUID("11111111-1111-4111-8111-111111111111")
 OWNER_B = UUID("22222222-2222-4222-8222-222222222222")
 ROLE_ID = UUID("33333333-3333-4333-8333-333333333333")
@@ -31,6 +36,10 @@ TABLES = (
     "digest_roles",
 )
 POLICY_COMMANDS = {"SELECT", "INSERT", "UPDATE", "DELETE"}
+
+# One (table, insert statement, params) case per table -- each attempts to
+# insert a row as Owner B that claims to belong to Owner A, to prove the
+# insert policy's "with check" blocks writing rows you don't own.
 UNAUTHORIZED_INSERTS = (
     (
         "roles",
@@ -87,14 +96,25 @@ UNAUTHORIZED_INSERTS = (
     ),
 )
 
+# Custom marker (registered in pyproject.toml) distinguishing this from
+# fast unit tests, per TESTING.md's unit/integration split.
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module")
 def database() -> Iterator[Connection]:
-    """Apply both migrations inside a transaction on a dedicated test project."""
+    """Apply both migrations inside a transaction on a dedicated test project.
+
+    This is a GENERATOR fixture: everything before `yield` is setup, the
+    yielded `connection` is handed to every test that asks for it, and
+    everything after `yield` is cleanup -- run once, after all tests using
+    this fixture have finished (scope="module" = shared across the whole
+    file, not recreated per test, since setup here is expensive).
+    """
     database_url = os.getenv(TEST_DB_URL_ENV)
     if not database_url:
+        # No test DB configured -- skip the whole file rather than fail,
+        # since this requires real infrastructure that isn't always present.
         pytest.skip(f"{TEST_DB_URL_ENV} is not set")
 
     connection = psycopg.connect(database_url)
@@ -108,6 +128,8 @@ def database() -> Iterator[Connection]:
                 """,
             ).fetchall()
             if existing:
+                # Safety check: refuse to run against a DB that already has
+                # tables, to avoid wiping/contaminating a real project.
                 pytest.fail(
                     f"{TEST_DB_URL_ENV} must point to a clean test database; "
                     f"found existing tables: {existing}"
@@ -117,14 +139,22 @@ def database() -> Iterator[Connection]:
             cursor.execute(RLS_PATH.read_text(encoding="utf-8"))
             _seed_test_rows(cursor)
 
-        yield connection
+        yield connection  # <-- pauses here; tests run using this connection
     finally:
+        # Resumes here once all tests are done -- undo everything, close up.
         connection.rollback()
         connection.close()
 
 
 def _seed_test_rows(cursor: psycopg.Cursor) -> None:
-    """Create two owners and one owner-A row in every application table."""
+    """Create two owners and one owner-A row in every application table.
+
+    Runs once, right after schema/RLS are applied, using the raw cursor
+    (no simulated role yet -- this is setup, not something under test).
+    """
+    # auth.users is Supabase's own internal auth table. Since there's no
+    # real signup flow in a test, insert fake user rows directly so the
+    # owner_id foreign keys have something valid to reference.
     cursor.execute(
         """
         insert into auth.users
@@ -137,6 +167,8 @@ def _seed_test_rows(cursor: psycopg.Cursor) -> None:
         """,
         (OWNER_A, OWNER_B),
     )
+    # One seeded row per table, all owned by OWNER_A -- gives every later
+    # test a known "someone else's data" baseline to try to see/not-see.
     cursor.execute(
         """
         insert into public.roles
@@ -195,13 +227,26 @@ def _execute_as(
     *,
     fetch: bool = False,
 ) -> tuple[list[tuple], int]:
-    """Execute once as an authenticated owner, then roll back that operation."""
+    """Execute once as an authenticated owner, then roll back that operation.
+
+    Simulates "logged in as a specific user" on ONE shared connection reused
+    across many tests, without one test's changes leaking into the next.
+    """
+    # A savepoint is a checkpoint inside the larger transaction -- lets us
+    # undo just this operation's changes without closing/reopening the
+    # whole connection (expensive) for every single test.
     connection.execute("savepoint rls_operation")
     error: Exception | None = None
     rows: list[tuple] = []
     rowcount = -1
     try:
+        # Switch this session to behave as the "authenticated" Postgres
+        # role (matches the RLS file's `grant ... to authenticated`),
+        # scoped only to the current transaction via "local".
         connection.execute("set local role authenticated")
+        # Mimic what Supabase's real infrastructure does with a genuine
+        # JWT: expose the caller's user ID as a session config variable.
+        # This is exactly what auth.uid() reads internally.
         connection.execute(
             "select set_config('request.jwt.claim.sub', %s, true)",
             (str(owner_id),),
@@ -210,13 +255,17 @@ def _execute_as(
         if fetch:
             rows = result.fetchall()
         rowcount = result.rowcount
-    except Exception as exc:  # re-raised after restoring the outer transaction
+    except Exception as exc:  # noqa: BLE001 -- re-raised below after cleanup
         error = exc
     finally:
+        # Cleanup ALWAYS runs, whether the query succeeded or raised --
+        # undoes any changes and resets the simulated identity.
         connection.execute("rollback to savepoint rls_operation")
         connection.execute("release savepoint rls_operation")
 
     if error is not None:
+        # Re-raise AFTER cleanup, so the caller's pytest.raises(...) still
+        # sees the original exception.
         raise error
     return rows, rowcount
 
@@ -224,6 +273,8 @@ def _execute_as(
 def test_schema__fresh_database__creates_exact_core_tables(
     database: Connection,
 ) -> None:
+    # Confirms exactly six tables exist -- nothing missing, nothing extra,
+    # nothing misspelled.
     rows = database.execute(
         """
         select tablename
@@ -239,6 +290,9 @@ def test_schema__fresh_database__creates_exact_core_tables(
 def test_schema__every_core_table__has_rls_enabled_and_forced(
     database: Connection,
 ) -> None:
+    # Queries Postgres's own system catalog to directly verify the
+    # `enable`/`force row level security` lines actually took effect --
+    # not just that the SQL ran without error.
     rows = database.execute(
         """
         select c.relname, c.relrowsecurity, c.relforcerowsecurity
@@ -256,6 +310,8 @@ def test_schema__every_core_table__has_rls_enabled_and_forced(
 def test_rls__every_core_table__has_policy_for_each_operation(
     database: Connection,
 ) -> None:
+    # Queries pg_policies to confirm all four verbs have a policy on every
+    # table -- catches a table accidentally missed among the 24 policies.
     rows = database.execute(
         """
         select tablename, cmd
@@ -276,6 +332,8 @@ def test_rls__every_core_table__has_policy_for_each_operation(
 def test_rls__different_owner_selects_table__returns_no_rows(
     database: Connection, table: str
 ) -> None:
+    # Logged in AS OWNER B, trying to read Owner A's seeded row -- RLS
+    # should make it invisible, not just filtered after the fact.
     rows, _ = _execute_as(
         database, OWNER_B, f"select owner_id from public.{table}", fetch=True
     )
@@ -287,6 +345,8 @@ def test_rls__different_owner_selects_table__returns_no_rows(
 def test_rls__different_owner_updates_table__affects_no_rows(
     database: Connection, table: str
 ) -> None:
+    # Owner B tries to overwrite EVERY row's owner_id (no WHERE clause) --
+    # if RLS works, zero rows are affected, since none belong to Owner B.
     _, rowcount = _execute_as(
         database,
         OWNER_B,
@@ -301,6 +361,7 @@ def test_rls__different_owner_updates_table__affects_no_rows(
 def test_rls__different_owner_deletes_table__affects_no_rows(
     database: Connection, table: str
 ) -> None:
+    # Same idea for delete: Owner B's blanket delete should affect nothing.
     _, rowcount = _execute_as(database, OWNER_B, f"delete from public.{table}")
 
     assert rowcount == 0
@@ -310,6 +371,9 @@ def test_rls__different_owner_deletes_table__affects_no_rows(
 def test_rls__owning_user_selects_table__returns_own_row(
     database: Connection, table: str
 ) -> None:
+    # The flip side of the tests above: Owner A, as themselves, DOES get
+    # their own row back -- proves RLS isn't blocking everyone, only
+    # non-owners.
     rows, _ = _execute_as(
         database, OWNER_A, f"select owner_id from public.{table}", fetch=True
     )
@@ -328,11 +392,17 @@ def test_rls__different_owner_inserts_table__raises_policy_violation(
     statement: str,
     parameters: tuple[object, ...],
 ) -> None:
+    # Owner B tries to insert a row CLAIMING to belong to Owner A -- the
+    # insert policy's "with check" should reject this outright, raising
+    # InsufficientPrivilege rather than silently succeeding or filtering.
     with pytest.raises(InsufficientPrivilege):
         _execute_as(database, OWNER_B, statement, parameters)
 
 
 def test_rls__anonymous_role__has_no_table_privileges(database: Connection) -> None:
+    # Directly verifies the RLS file's `revoke all ... from anon` --
+    # confirms the anon role has ZERO grants on any table, not just that
+    # RLS would also block it.
     rows = database.execute(
         """
         select table_name,
@@ -348,6 +418,9 @@ def test_rls__anonymous_role__has_no_table_privileges(database: Connection) -> N
 
 
 def test_digest__unresolved_role__prevents_review(database: Connection) -> None:
+    # Exercises Trigger 1 (enforce_digest_review_state): marking a digest
+    # reviewed while its linked role is still unresolved should raise
+    # CheckViolation (errcode 23514, set explicitly in the trigger function).
     database.execute("savepoint digest_review")
     try:
         with pytest.raises(CheckViolation, match="all its roles are resolved"):
@@ -361,6 +434,8 @@ def test_digest__unresolved_role__prevents_review(database: Connection) -> None:
 
 
 def test_digest__all_roles_resolved__allows_review(database: Connection) -> None:
+    # The accept side: resolve the role FIRST, then marking the digest
+    # reviewed should succeed and actually persist reviewed_at.
     database.execute("savepoint digest_review")
     try:
         database.execute(
